@@ -25,7 +25,11 @@ import glm_quota_core as core  # noqa: E402
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
-from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+from PyQt6.QtWidgets import (
+    QApplication, QSystemTrayIcon, QMenu, QMessageBox,
+    QDialog, QFormLayout, QLineEdit, QComboBox, QSpinBox, QCheckBox,
+    QDialogButtonBox, QLabel, QHBoxLayout,
+)
 
 
 # 用量阈值颜色（绿/橙/红）
@@ -107,6 +111,103 @@ def _fmt_local(iso):
         return str(iso)
 
 
+class ConfigDialog(QDialog):
+    """可视化配置对话框：表单编辑 api_key / base_url / 刷新间隔 / 通知阈值。
+
+    api_key 用密码模式输入框，右侧带"显示/隐藏"切换按钮，避免肩窥；
+    其余字段用下拉/数字框，防止格式错误。确定即写回 config.json(权限600)。
+    """
+
+    BASE_URLS = [
+        ("中国站 open.bigmodel.cn", "https://open.bigmodel.cn"),
+        ("国际站 api.z.ai", "https://api.z.ai"),
+    ]
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("智谱 Coding Plan — 配置")
+        self.setMinimumWidth(460)
+        self._cfg = dict(cfg)  # 不直接改原 dict，取消时不影响
+
+        form = QFormLayout(self)
+        form.setSpacing(10)
+
+        # api_key：密码模式 + 显示切换
+        self.key_edit = QLineEdit(self._cfg.get("api_key", ""))
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.setPlaceholderText("在此填入智谱 api_key")
+        key_row = QHBoxLayout()
+        key_row.setContentsMargins(0, 0, 0, 0)
+        key_row.addWidget(self.key_edit)
+        self.show_key_btn = QAction("显示", self)
+        # 用带 checkable 的按钮做显示/隐藏
+        from PyQt6.QtWidgets import QToolButton
+        self.toggle_btn = QToolButton(checkable=True, text="显示")
+        self.toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.toggle_btn.toggled.connect(self._toggle_key_visible)
+        key_row.addWidget(self.toggle_btn)
+        from PyQt6.QtWidgets import QWidget
+        key_wrap = QWidget()
+        key_wrap.setLayout(key_row)
+        form.addRow("API Key:", key_wrap)
+
+        # base_url：下拉，但若现有值不在列表里则追加一项
+        self.url_combo = QComboBox()
+        cur_url = self._cfg.get("base_url", "https://open.bigmodel.cn")
+        for label, val in self.BASE_URLS:
+            self.url_combo.addItem(label, val)
+        if cur_url not in [v for _, v in self.BASE_URLS]:
+            self.url_combo.addItem(cur_url, cur_url)
+        self.url_combo.setCurrentIndex(self.url_combo.findData(cur_url))
+        form.addRow("接口站点:", self.url_combo)
+
+        # 自动刷新间隔
+        self.refresh_spin = QSpinBox()
+        self.refresh_spin.setRange(0, 1440)
+        self.refresh_spin.setSuffix(" 分钟")
+        self.refresh_spin.setSpecialValueText("关闭自动刷新")
+        self.refresh_spin.setValue(int(self._cfg.get("refresh_minutes", 30)))
+        form.addRow("自动刷新:", self.refresh_spin)
+
+        # 通知阈值
+        self.notify_spin = QSpinBox()
+        self.notify_spin.setRange(0, 100)
+        self.notify_spin.setSuffix(" %")
+        self.notify_spin.setSpecialValueText("关闭通知")
+        self.notify_spin.setValue(int(self._cfg.get("notify_threshold", 85)))
+        form.addRow("超量提醒阈值:", self.notify_spin)
+
+        hint = QLabel("提示：api_key 仅保存在本机配置文件(权限 600)，不会上传任何地方。\n"
+                      "国内站(bigmodel.cn)与国际站(z.ai)的 key 不通用。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        form.addRow(hint)
+
+        # 确定/取消
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _toggle_key_visible(self, checked):
+        if checked:
+            self.key_edit.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.toggle_btn.setText("隐藏")
+        else:
+            self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+            self.toggle_btn.setText("显示")
+
+    def values(self):
+        """返回填好的配置 dict。"""
+        return {
+            "api_key": self.key_edit.text().strip(),
+            "base_url": self.url_combo.currentData(),
+            "refresh_minutes": self.refresh_spin.value(),
+            "notify_threshold": self.notify_spin.value(),
+        }
+
+
 class QueryWorker(QThread):
     """后台查询线程，避免阻塞 UI。"""
     finished = pyqtSignal(object)  # 发 QuotaResult
@@ -151,7 +252,7 @@ class TrayApp:
         act_refresh = QAction("立即刷新", menu)
         act_refresh.triggered.connect(self.refresh)
         menu.addAction(act_refresh)
-        act_edit = QAction("编辑配置(设置 api_key)", menu)
+        act_edit = QAction("配置…", menu)
         act_edit.triggered.connect(self._edit_config)
         menu.addAction(act_edit)
         menu.addSeparator()
@@ -173,11 +274,12 @@ class TrayApp:
             sys.exit(1)
         self.tray.show()
 
-        # 首次启动：若无 key，弹提示引导编辑配置
+        # 首次启动：若无 key，直接弹配置对话框引导填写
         if not self.cfg.get("api_key"):
             self._update_icon(None, errored=True)
-            self.tray.setToolTip("未配置 api_key，请右键 → 编辑配置")
-            _notify("智谱用量监控", "未配置 api_key，请右键托盘图标 → 编辑配置(设置 api_key)")
+            self.tray.setToolTip("未配置 api_key")
+            _notify("智谱用量监控", "首次使用，请填写 api_key")
+            self._edit_config()
         else:
             self.refresh()
             self._start_timer()
@@ -198,18 +300,15 @@ class TrayApp:
             self.refresh()
 
     def _edit_config(self):
-        """调起编辑器编辑配置文件，然后重载。"""
-        cfg_path = core.CONFIG_PATH
-        # 优先用系统默认编辑器打开；KDE 下 xdg-open 会用 kwrite/kate
-        for editor in (os.environ.get("EDITOR"), "kwrite", "kate", "gedit", "nano"):
-            if editor:
-                try:
-                    subprocess.Popen([editor, cfg_path])
-                    _notify("智谱用量监控", "请在编辑器中填写 api_key 后保存，然后点'立即刷新'。")
-                    return
-                except FileNotFoundError:
-                    continue
-        _notify("智谱用量监控", "请手动编辑: %s" % cfg_path)
+        """打开可视化配置对话框，确定即写回并立即生效。"""
+        dlg = ConfigDialog(self.cfg)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_cfg = dlg.values()
+            core.save_config(new_cfg)
+            self.cfg = new_cfg
+            self._start_timer()  # 刷新间隔可能变了
+            _notify("智谱用量监控", "配置已保存。")
+            self.refresh()       # 立即用新配置查一次
 
     def _show_detail(self):
         r = self.last_result
