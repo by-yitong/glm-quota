@@ -32,7 +32,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/1944876825/glm-quota.git
+git clone https://github.com/by-yitong/glm-quota.git
 cd glm-quota
 pip install --user PyQt6     # 托盘版需要
 ./install.sh                 # 部署到 ~/.local/bin 等，配置开机自启
