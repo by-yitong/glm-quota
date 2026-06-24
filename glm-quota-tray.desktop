@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GLM Coding Plan 用量监控
+Comment=系统托盘常驻显示智谱 GLM Coding Plan 用量
+Exec=/home/admins/.local/bin/glm-quota-tray
+Icon=utilities-system-monitor
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
+StartupNotify=false

@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+智谱 GLM Coding Plan 用量 —— KDE 系统托盘常驻应用。
+
+功能：
+  - 任务栏托盘图标直接显示当前 5 小时窗口已用百分比（如 "73%"）
+  - 颜色随用量变化：<60% 绿 / 60-85% 橙 / >85% 红 / 错误灰
+  - 右键菜单：详情、立即刷新、退出
+  - 左键点击：刷新
+  - 可选定时自动刷新 + 超阈值桌面通知
+  - 网络请求在 QThread 后台线程，不卡 UI
+  - 失败时保留上次成功值，图标标 ERR
+
+依赖：PyQt6 + glm_quota_core.py（同目录的 share 下）
+"""
+
+import os
+import sys
+import subprocess
+from datetime import datetime
+
+sys.path.insert(0, os.path.expanduser("~/.local/share/glm-quota"))
+import glm_quota_core as core  # noqa: E402
+
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+
+
+# 用量阈值颜色（绿/橙/红）
+def _color_for_pct(pct):
+    if pct is None:
+        return QColor(150, 150, 150)  # 灰：无数据
+    if pct >= 85:
+        return QColor(232, 80, 80)    # 红
+    if pct >= 60:
+        return QColor(230, 160, 50)   # 橙
+    return QColor(70, 180, 90)        # 绿
+
+
+def _make_icon_text(pct):
+    """图标上显示的短文字。"""
+    if pct is None:
+        return "?"
+    return "%d%%" % round(pct)
+
+
+def _make_icon(pct, errored=False):
+    """生成带文字的图标。
+
+    用高分辨率源图绘制，再注册多尺寸(32/48/64)供托盘容器按需缩放，
+    避免小尺寸渲染时文字糊/虚。文字字号随尺寸自适应、占比更大更醒目。
+    """
+    # 各显示尺寸对应的目标像素字号
+    SIZES = (32, 48, 64)
+
+    if errored:
+        bg = QColor(180, 60, 60)
+        text_color = QColor(255, 255, 255)
+        text = "ERR"
+    else:
+        bg = _color_for_pct(pct)
+        text_color = QColor(255, 255, 255)
+        text = _make_icon_text(pct)
+
+    icon = QIcon()
+    for size in SIZES:
+        # 文字字号：取显示尺寸的较大比例，让百分比醒目
+        if len(text) <= 3:        # 如 "73%"
+            font_px = int(size * 0.40)
+        else:                     # 如 "ERR" / "120%"
+            font_px = int(size * 0.28)
+
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        # 圆角背景
+        p.setBrush(bg)
+        p.setPen(Qt.PenStyle.NoPen)
+        r = max(4, size * 0.2)
+        p.drawRoundedRect(0, 0, size, size, r, r)
+
+        # 文字
+        p.setPen(text_color)
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(font_px)
+        p.setFont(font)
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, text)
+        p.end()
+        icon.addPixmap(pm, QIcon.Mode.Normal, QIcon.State.Off)
+    return icon
+
+
+def _fmt_local(iso):
+    if not iso:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso)
+        return dt.astimezone().strftime("%m-%d %H:%M")
+    except Exception:
+        return str(iso)
+
+
+class QueryWorker(QThread):
+    """后台查询线程，避免阻塞 UI。"""
+    finished = pyqtSignal(object)  # 发 QuotaResult
+
+    def __init__(self, api_key, base_url):
+        super().__init__()
+        self.api_key = api_key
+        self.base_url = base_url
+
+    def run(self):
+        try:
+            result = core.query_quota(self.api_key, self.base_url)
+        except Exception as e:
+            result = core.QuotaResult(ok=False, error="异常: %s" % e,
+                                      credential_valid=True,
+                                      queried_at=core._now_millis())
+        self.finished.emit(result)
+
+
+class TrayApp:
+    def __init__(self):
+        self.cfg = core.load_config()
+        self.last_result = None        # 上次成功的 QuotaResult（用于失败时保留展示）
+        self.worker = None             # 当前查询线程
+        self.last_notified_pct = None  # 防止通知风暴
+
+        self.app = QApplication.instance() or QApplication(sys.argv)
+        self.app.setApplicationName("glm-quota-tray")
+        self.app.setQuitOnLastWindowClosed(False)
+
+        # 托盘
+        self.tray = QSystemTrayIcon(_make_icon(None))
+        self.tray.setToolTip("智谱 Coding Plan 用量（点击刷新）")
+        self.tray.activated.connect(self._on_activated)
+
+        # 菜单
+        menu = QMenu()
+        self.act_detail = QAction("用量详情", menu)
+        self.act_detail.triggered.connect(self._show_detail)
+        menu.addAction(self.act_detail)
+        menu.addSeparator()
+        act_refresh = QAction("立即刷新", menu)
+        act_refresh.triggered.connect(self.refresh)
+        menu.addAction(act_refresh)
+        act_edit = QAction("编辑配置(设置 api_key)", menu)
+        act_edit.triggered.connect(self._edit_config)
+        menu.addAction(act_edit)
+        menu.addSeparator()
+        act_quit = QAction("退出", menu)
+        act_quit.triggered.connect(self.app.quit)
+        menu.addAction(act_quit)
+        self.menu = menu
+        self.tray.setContextMenu(menu)
+
+        # 定时刷新
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh)
+
+    # ── 启动 ──────────────────────────────────────────────
+    def run(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            # 无托盘环境（纯命令行）回退提示
+            sys.stderr.write("未检测到系统托盘，无法常驻。请在桌面会话中运行。\n")
+            sys.exit(1)
+        self.tray.show()
+
+        # 首次启动：若无 key，弹提示引导编辑配置
+        if not self.cfg.get("api_key"):
+            self._update_icon(None, errored=True)
+            self.tray.setToolTip("未配置 api_key，请右键 → 编辑配置")
+            _notify("智谱用量监控", "未配置 api_key，请右键托盘图标 → 编辑配置(设置 api_key)")
+        else:
+            self.refresh()
+            self._start_timer()
+        sys.exit(self.app.exec())
+
+    def _start_timer(self):
+        mins = self.cfg.get("refresh_minutes", 30)
+        if mins and mins > 0:
+            self.timer.start(int(mins * 60 * 1000))
+        else:
+            self.timer.stop()
+
+    # ── 交互 ──────────────────────────────────────────────
+    def _on_activated(self, reason):
+        # 左键 / 单击 → 刷新（中键也行）
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.MiddleClick):
+            self.refresh()
+
+    def _edit_config(self):
+        """调起编辑器编辑配置文件，然后重载。"""
+        cfg_path = core.CONFIG_PATH
+        # 优先用系统默认编辑器打开；KDE 下 xdg-open 会用 kwrite/kate
+        for editor in (os.environ.get("EDITOR"), "kwrite", "kate", "gedit", "nano"):
+            if editor:
+                try:
+                    subprocess.Popen([editor, cfg_path])
+                    _notify("智谱用量监控", "请在编辑器中填写 api_key 后保存，然后点'立即刷新'。")
+                    return
+                except FileNotFoundError:
+                    continue
+        _notify("智谱用量监控", "请手动编辑: %s" % cfg_path)
+
+    def _show_detail(self):
+        r = self.last_result
+        if r is None or not r.ok:
+            QMessageBox.information(None, "智谱 Coding Plan 用量",
+                                    "暂无数据。\n%s" %
+                                    ((r.error if r else "请先刷新"), ))
+            return
+        lines = ["套餐等级: %s" % (r.level or "未知"), ""]
+        if not r.tiers:
+            lines.append("（无可用窗口数据）")
+        else:
+            for t in r.tiers:
+                label = {"five_hour": "5小时窗口",
+                         "weekly_limit": "每周窗口"}.get(t.name, t.name)
+                lines.append("%s：%5.1f%%" % (label, t.utilization))
+                lines.append("    重置时间: %s" % _fmt_local(t.resets_at))
+        lines += ["", "查询时间: %s" %
+                  datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+        QMessageBox.information(None, "智谱 Coding Plan 用量", "\n".join(lines))
+
+    # ── 查询 ──────────────────────────────────────────────
+    def refresh(self):
+        if self.worker is not None and self.worker.isRunning():
+            return  # 防止重复并发
+        if not self.cfg.get("api_key"):
+            self.tray.setToolTip("未配置 api_key，请右键 → 编辑配置")
+            return
+        self.tray.setToolTip("正在查询…")
+        self.worker = QueryWorker(self.cfg["api_key"], self.cfg.get("base_url", "https://api.z.ai"))
+        self.worker.finished.connect(self._on_query_done)
+        self.worker.start()
+
+    def _on_query_done(self, result):
+        # 重载配置（用户可能改了 key/阈值）
+        self.cfg = core.load_config()
+        self._start_timer()
+
+        if result.ok:
+            self.last_result = result
+            pct = core.primary_percentage(result)
+            self._update_icon(pct, errored=False)
+            self._update_tooltip(result, pct)
+            self._maybe_notify(pct)
+        else:
+            # 失败：保留上次成功值展示，但标红 + tooltip 带 error
+            pct = core.primary_percentage(self.last_result) if self.last_result else None
+            errored = not result.credential_valid  # key 失效才标红
+            self._update_icon(pct, errored=errored)
+            tip = result.error or "查询失败"
+            if self.last_result and self.last_result.ok and not errored:
+                tip = "%s（展示为上次成功值）" % tip
+            self.tray.setToolTip(tip[:200])
+
+    def _update_icon(self, pct, errored=False):
+        self.tray.setIcon(_make_icon(pct, errored=errored))
+
+    def _update_tooltip(self, result, pct):
+        parts = ["智谱 Coding Plan"]
+        if result.level:
+            parts.append("[%s]" % result.level)
+        if pct is not None:
+            parts.append("5h窗口 %d%%" % round(pct))
+        # 周窗口也带上
+        wk = core.tier_by_name(result, core.TIER_WEEKLY)
+        if wk:
+            parts.append("周窗口 %d%%" % round(wk.utilization))
+        self.tray.setToolTip(" ".join(parts))
+
+    def _maybe_notify(self, pct):
+        thr = self.cfg.get("notify_threshold", 85)
+        if not thr or thr <= 0 or pct is None:
+            return
+        if pct >= thr and self.last_notified_pct is not None and self.last_notified_pct < thr:
+            # 仅在跨过阈值时通知一次，避免每次刷新都弹
+            _notify("智谱 Coding Plan 用量告警",
+                    "5小时窗口已用 %d%%（超过阈值 %d%%）" % (round(pct), thr))
+        self.last_notified_pct = pct
+
+
+def _notify(title, body):
+    """桌面通知：优先 notify-send（跨桌面环境），失败回退托盘消息。"""
+    try:
+        subprocess.run(["notify-send", "--app-name=glm-quota",
+                        "--icon=dialog-information", title, body],
+                       check=False, timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def main():
+    app = TrayApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

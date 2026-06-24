@@ -1,0 +1,6 @@
+{
+  "api_key": "在此填入你的智谱 api_key",
+  "base_url": "https://open.bigmodel.cn",
+  "refresh_minutes": 30,
+  "notify_threshold": 85
+}

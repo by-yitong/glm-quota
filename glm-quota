@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+智谱 GLM Coding Plan 用量 —— 命令行版。
+
+用法：
+  glm-quota            查询并打印用量
+  glm-quota -j         输出原始 JSON（便于脚本处理）
+  glm-quota -w         watch 模式，每 60 秒刷新一次
+  glm-quota set-key    交互式设置 api_key（写入 config.json）
+
+依赖：仅标准库 + 同目录的 glm_quota_core.py
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+# 把核心模块所在目录加入 path
+sys.path.insert(0, os.path.expanduser("~/.local/share/glm-quota"))
+import glm_quota_core as core  # noqa: E402
+
+
+def _fmt_resets_at(iso: str) -> str:
+    """ISO 8601 → 本地时间可读字符串。"""
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(iso)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M (%Z)")
+    except Exception:
+        return iso or "-"
+
+
+def _print_human(result: core.QuotaResult) -> int:
+    """人类可读输出，返回退出码（0=成功, 1=失败）。"""
+    if not result.ok:
+        line = "❌ " + (result.error or "查询失败")
+        if not result.credential_valid:
+            line += "  [key 失效，请检查 api_key]"
+        print(line)
+        return 1
+
+    print("✅ 智谱 GLM Coding Plan 用量")
+    print("套餐等级: %s" % (result.level or "未知"))
+    print("-" * 40)
+    if not result.tiers:
+        print("（无可用窗口数据）")
+    else:
+        for t in result.tiers:
+            label = {"five_hour": "5小时窗口", "weekly_limit": "每周窗口"}.get(t.name, t.name)
+            pct = t.utilization
+            # 进度条
+            bar_len = 20
+            filled = max(0, min(bar_len, int(round(pct / 100 * bar_len))))
+            bar = "█" * filled + "░" * (bar_len - filled)
+            print("%-8s %s %5.1f%%" % (label, bar, pct))
+            print("         重置时间: %s" % _fmt_resets_at(t.resets_at))
+    print("-" * 40)
+    print("查询时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    return 0
+
+
+def _do_set_key() -> int:
+    """交互式设置 api_key。"""
+    cfg = core.load_config()
+    print("当前 base_url: %s" % cfg["base_url"])
+    print("请输入智谱 api_key（直接回车保持不变；输入后不会回显到任何日志）:")
+    try:
+        key = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n已取消")
+        return 1
+    if key:
+        cfg["api_key"] = key
+        core.save_config(cfg)
+        print("✅ 已保存到 %s（权限 600）" % core.CONFIG_PATH)
+    else:
+        print("未修改")
+    # 顺便允许改 base_url
+    print("base_url 含 bigmodel.cn 则走中国站，否则走国际站(z.ai)。直接回车保持不变:")
+    try:
+        bu = input("base_url [%s]: " % cfg["base_url"]).strip()
+    except (EOFError, KeyboardInterrupt):
+        bu = ""
+    if bu:
+        cfg["base_url"] = bu
+        core.save_config(cfg)
+        print("✅ base_url 已更新")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="glm-quota",
+        description="查询智谱 GLM Coding Plan 用量")
+    p.add_argument("-j", "--json", action="store_true", help="输出 JSON")
+    p.add_argument("-w", "--watch", type=int, nargs="?", const=60, metavar="SEC",
+                   help="watch 模式，每 N 秒刷新（默认 60）")
+    p.add_argument("--base-url", default=None, help="覆盖 config 中的 base_url")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("set-key", help="交互式设置 api_key")
+    args = p.parse_args()
+
+    if args.cmd == "set-key":
+        return _do_set_key()
+
+    cfg = core.load_config()
+    base_url = args.base_url or cfg["base_url"]
+
+    def run_once() -> int:
+        result = core.query_quota(cfg["api_key"], base_url)
+        if args.json:
+            out = {
+                "ok": result.ok,
+                "level": result.level,
+                "error": result.error,
+                "credential_valid": result.credential_valid,
+                "queried_at": result.queried_at,
+                "tiers": [{"name": t.name, "utilization": t.utilization,
+                           "resets_at": t.resets_at} for t in result.tiers],
+            }
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        else:
+            _print_human(result)
+        return 0 if result.ok else 1
+
+    if args.watch:
+        try:
+            while True:
+                os.system("clear" if os.name == "posix" else "cls")
+                run_once()
+                print("\n（每 %d 秒刷新，Ctrl+C 退出）" % args.watch)
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            print("\n已退出 watch 模式")
+        return 0
+
+    return run_once()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
