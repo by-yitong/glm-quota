@@ -33,6 +33,18 @@ def _fmt_resets_at(iso: str) -> str:
         return iso or "-"
 
 
+def _fmt_queried_at(ms) -> str:
+    """毫秒时间戳 → 本地时间字符串（最近一次成功刷新接口的时刻）。"""
+    if not ms:
+        return "—"
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ms)
+
+
 def _print_human(result: core.QuotaResult) -> int:
     """人类可读输出，返回退出码（0=成功, 1=失败）。"""
     if not result.ok:
@@ -58,7 +70,7 @@ def _print_human(result: core.QuotaResult) -> int:
             print("%-8s %s %5.1f%%" % (label, bar, pct))
             print("         重置时间: %s" % _fmt_resets_at(t.resets_at))
     print("-" * 40)
-    print("查询时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("最近刷新: %s" % _fmt_queried_at(result.queried_at))
     return 0
 
 
