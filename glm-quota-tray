@@ -31,6 +31,41 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QLabel, QHBoxLayout,
 )
 
+# 开机自启的 desktop 文件路径
+AUTOSTART_DIR = os.path.expanduser("~/.config/autostart")
+AUTOSTART_PATH = os.path.join(AUTOSTART_DIR, "glm-quota-tray.desktop")
+# 自启 desktop 内容（Exec 指向本脚本绝对路径）
+SCRIPT_PATH = os.path.realpath(__file__)
+AUTOSTART_DESKTOP = """[Desktop Entry]
+Type=Application
+Name=GLM Coding Plan 用量监控
+Comment=系统托盘常驻显示智谱 GLM Coding Plan 用量
+Exec={script}
+Icon=utilities-system-monitor
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
+StartupNotify=false
+"""
+
+
+def autostart_enabled() -> bool:
+    """检查是否已配置开机自启。"""
+    return os.path.isfile(AUTOSTART_PATH)
+
+
+def set_autostart(enabled: bool) -> None:
+    """启用/禁用开机自启（写/删 desktop 文件）。"""
+    if enabled:
+        os.makedirs(AUTOSTART_DIR, exist_ok=True)
+        with open(AUTOSTART_PATH, "w", encoding="utf-8") as f:
+            f.write(AUTOSTART_DESKTOP.format(script=SCRIPT_PATH))
+    else:
+        try:
+            os.remove(AUTOSTART_PATH)
+        except FileNotFoundError:
+            pass
+
 
 # 用量阈值颜色（绿/橙/红）
 def _color_for_pct(pct):
@@ -177,6 +212,11 @@ class ConfigDialog(QDialog):
         self.notify_spin.setValue(int(self._cfg.get("notify_threshold", 85)))
         form.addRow("超量提醒阈值:", self.notify_spin)
 
+        # 开机自启开关
+        self.autostart_check = QCheckBox("登录桌面时自动启动托盘")
+        self.autostart_check.setChecked(autostart_enabled())
+        form.addRow("开机自启:", self.autostart_check)
+
         hint = QLabel("提示：api_key 仅保存在本机配置文件(权限 600)，不会上传任何地方。\n"
                       "国内站(bigmodel.cn)与国际站(z.ai)的 key 不通用。")
         hint.setWordWrap(True)
@@ -307,6 +347,8 @@ class TrayApp:
             core.save_config(new_cfg)
             self.cfg = new_cfg
             self._start_timer()  # 刷新间隔可能变了
+            # 开机自启开关
+            set_autostart(dlg.autostart_check.isChecked())
             _notify("智谱用量监控", "配置已保存。")
             self.refresh()       # 立即用新配置查一次
 
