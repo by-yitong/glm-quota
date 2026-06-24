@@ -67,7 +67,7 @@ def default_config() -> dict:
     return {
         "api_key": "",
         "base_url": "https://api.z.ai",
-        "refresh_minutes": 30,       # 托盘自动刷新间隔(0=不自动刷新)
+        "refresh_minutes": 5,        # 托盘自动刷新间隔(0=不自动刷新)
         "notify_threshold": 85,      # 超过该百分比弹桌面通知(0=关闭)
     }
 
